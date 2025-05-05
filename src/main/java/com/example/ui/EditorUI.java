@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import javafx.application.Application;
 import javafx.application.Platform;
+import javafx.geometry.Bounds;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Node;
@@ -11,6 +12,7 @@ import javafx.scene.Scene;
 import javafx.scene.control.*;
 import javafx.scene.input.ClipboardContent;
 import javafx.scene.input.KeyEvent;
+import javafx.scene.input.MouseEvent;
 import javafx.scene.layout.*;
 import javafx.scene.paint.Color;
 import javafx.scene.shape.Line;
@@ -44,8 +46,8 @@ public class EditorUI extends Application {
     private ListView<String> viewersList;
     private Label docNameLabel;
 
-    // private String userId;
-    // private String username;
+     private String userId;
+     private String username;
     private Document currentDoc;
     private CollabService collabService;
     private User currentUser;
@@ -55,7 +57,8 @@ public class EditorUI extends Application {
 
     private final java.util.List<String> characterIds = new java.util.ArrayList<>();
     private int charIdCounter = 0;
-
+    // For tracking character ID
+    private int currentUserId = 0;
     @Override
     public void start(Stage stage) {
         this.primary = stage;
@@ -92,6 +95,7 @@ public class EditorUI extends Application {
             if (currentUser != null) {
                 createBtn.setDisable(false);
                 joinBtn.setDisable(false);
+                currentUserId = Math.abs(currentUser.getId().hashCode()); // Set user ID here
                 showAlert("User created! You can now create or join a session.");
             } else {
                 showAlert("User creation failed.");
@@ -183,16 +187,53 @@ public class EditorUI extends Application {
             }
 
             @Override
+
             public void onPresence(List<User> editors, List<User> viewers) {
-                //Platform.runLater(() -> usersList.getItems().setAll(users.stream().map(User::getUsername).toList()));
                 Platform.runLater(() -> {
-                    //usersList.getItems().setAll(users.stream().map(User::getUsername).toList());
                     editorsList.getItems().setAll(editors.stream().map(User::getUsername).toList());
                     viewersList.getItems().setAll(viewers.stream().map(User::getUsername).toList());
-                    
-                    // Optionally, clear editors/viewers if not present in this message
+
+                    // ⬇️ repaint all remote cursors
+                    if (textArea != null) {
+                        Pane content = (Pane) textArea.lookup(".content");
+                        if (content != null) {
+                            cursorLines.values().forEach(content.getChildren()::remove);
+                            cursorLines.clear();
+                            for (User u : editors) {
+                                if (!u.getId().equals(currentUser.getId())) {
+                                    updateCursor(u.getId(), u.getCursorPosition());
+                                }
+                            }
+                        }
+                    }
                 });
             }
+
+            private void updateCursor(String userId, int pos) {
+                Pane content = (Pane) textArea.lookup(".content");
+                if (content == null) return;
+
+                Line old = cursorLines.remove(userId);
+                if (old != null) content.getChildren().remove(old);
+
+                int saved = textArea.getCaretPosition();
+                textArea.positionCaret(pos);
+                Node caret = textArea.lookup(".caret");
+
+                if (caret != null) {
+                    Bounds b = caret.getBoundsInParent();
+                    Line line = new Line(b.getMinX(), b.getMinY(), b.getMinX(), b.getMaxY());
+                    Color color = cursorColors[Math.abs(userId.hashCode()) % cursorColors.length];
+                    line.setStroke(color);
+                    line.setStrokeWidth(2);
+                    content.getChildren().add(line);
+                    cursorLines.put(userId, line);
+                }
+
+                textArea.positionCaret(saved); // restore your own caret
+            }
+
+
 
             @Override
             public void onCursor(String userId, int pos) {
@@ -204,6 +245,12 @@ public class EditorUI extends Application {
                 Platform.runLater(() -> showAlert("Error: " + errorMsg));
             }
         }, currentUser);
+    }
+    private void sendCursor() {
+        if (collabService == null || currentDoc == null) return;
+        int pos = textArea.getCaretPosition();
+        currentUser.setCursorPosition(pos);  // update user’s internal state
+        collabService.sendCursorUpdate(currentDoc.getId(), pos, currentUser);
     }
 
     private void buildEditorScene() {
@@ -262,7 +309,8 @@ public class EditorUI extends Application {
         textArea.setDisable(true);
         textArea.setWrapText(true);
         textArea.addEventFilter(KeyEvent.KEY_TYPED, this::sendEdit);
-
+        textArea.addEventFilter(KeyEvent.KEY_RELEASED, e -> sendCursor());
+        textArea.addEventFilter(    MouseEvent.MOUSE_RELEASED, e -> sendCursor());
         VBox editorBox = new VBox(5, textArea);
         VBox.setVgrow(textArea, Priority.ALWAYS);
         editorBox.setPadding(new Insets(10));
@@ -306,26 +354,36 @@ public class EditorUI extends Application {
     // }
 
     private void sendEdit(KeyEvent ev) {
-        if (collabService == null || currentDoc == null) return;
-    
+        if (collabService == null || currentDoc == null)
+            return;
+
         int caretPos = textArea.getCaretPosition();
         String ch = ev.getCharacter();
-        String opType = "INSERT";
-        String characterId = currentUser.getId() + ":" + (charIdCounter++);
-    
+        String currentText = textArea.getText();
+
+        // Get the parent ID (similar to JS version)
+        int parentId = caretPos == 0 ? -1 :
+                (characterIds.isEmpty() || caretPos - 1 >= characterIds.size()) ?
+                        -1 : Integer.parseInt(characterIds.get(caretPos - 1));
+
         // Determine operation type
-        if (ev.getEventType() == KeyEvent.KEY_TYPED && (ch == null || ch.isEmpty())) {
+        String opType = "INSERT";
+        if (ch.equals("\b")) { // Backspace
             opType = "DELETE";
-            if (caretPos == 0 || characterIds.isEmpty()) return;
-            String deletedCharId = characterIds.remove(caretPos - 1);
-            collabService.sendDeleteOperation(currentDoc.getId(), caretPos - 1, deletedCharId, currentUser);
-            return;
         }
-    
-        // INSERT operation
-        String parentId = (caretPos == 0) ? "-1" : characterIds.get(caretPos - 1);
-        characterIds.add(caretPos, characterId);
-        collabService.sendInsertOperation(currentDoc.getId(), parentId, ch, characterId, currentUser);
+
+        // Call the method with the correct parameter types
+        collabService.sendEditOperation(
+                currentDoc.getId(), // sessionId
+                opType,            // opType
+                parentId,          // caretPos/parentId
+                ch,                // ch
+                currentText,       // content (current text)
+                currentUser        // user
+        );
+
+        // Also send cursor position update
+        sendCursor();
     }
 
 

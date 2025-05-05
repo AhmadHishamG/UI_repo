@@ -22,9 +22,9 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 
-public class CollabService {
-    private static final String BASE_URL = "http://localhost:6969";
-    private static final String WS_URL = "ws://localhost:6969/ws";
+public class CollabService  {
+    private static final String BASE_URL = "http://localhost:3000";
+    private static final String WS_URL = "ws://localhost:3000/ws";
 
     private User user;
 
